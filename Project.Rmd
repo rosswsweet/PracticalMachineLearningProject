@@ -1,0 +1,152 @@
+---
+title: "Predicting Activity Type from Motion Data"
+author: "Ross Sweet"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+
+```{r packages}
+library(ggplot2)
+library(caret)
+library(pgmm)
+library(rpart)
+library(gbm)
+library(e1071)
+library(glmnet)
+library(elasticnet)
+library(randomForest)
+library(dplyr)
+library(klaR)
+```
+
+## Executive Summary
+
+Motion data from wearable sensors is used to classify activity type using a random forest model. The random forest model was chosen over naive Bayes and linear discriminant analysis models through analysis of error rates estimated by cross validation. A list of predicted classes for test data is then computed using the random forest model.
+
+## Data Summary
+
+The Human Activity Recognition data sets from [Groupware@LES](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises) is the result of research done by Ugulino, et al. Each data set contains measurements of accelerometer data from wearable devices during differnt activity types. The data sets are read into R with blank values and Excel formula errors due to missing values formatted as NA.
+
+```{r import}
+train <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"), 
+                  header = TRUE,
+                  na.strings = c("NA", "", "#DIV/0!"))
+test <- read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"),
+                 header = TRUE,
+                 na.strings = c("NA", "", "#DIV/0!"))
+```
+
+There are two data sets, one labeled as train and the other as test. Both sets contain measurements on `r ncol(train)` variables. The sets contain `r nrow(train)` and `r nrow(test)` observations, respectively. The last column of each data set is different. In the train set, the last column, classe, is the classification of the observed activity. This column is missing from the test set and is replaced by an id marker.
+
+Although the data is already tidy, there data is not yet clean. When we consider columns with NA values in the train, we see that there are `r sum(colSums(is.na(train)) == 0)` columns with no NAs and `r sum(colSums(is.na(train)) > 19000)` with at least 19,000 NAs. We will thus choose to remove columns with NAs in the train set from both data sets.
+
+In addition, since we are not going to consider the data as a time series, and since we do not need identifying user information, we will remove the first seven columns.
+
+```{r clean}
+traincl <- train %>%
+        dplyr::select(-(1:7)) %>%
+        select_if(colSums(is.na(.)) == 0) %>%
+        mutate(classe = as.factor(classe))
+testcl <- test %>%
+        dplyr::select(-(1:7)) %>%
+        select_if(colSums(is.na(.)) == 0)
+```
+
+
+## Model Selection
+
+Three models types were investigated on the training set, linear descriminant analysis (LDA), naive Bayes with principal component analysis (PCA), and random forests.
+
+### Linear Discriminant Analysis
+
+We will build a model for classe using linear discriminant analysis, applying 10-fold cross validation.
+
+```{r LDA}
+modlda <- train(classe ~ .,
+                data = traincl,
+                method = "lda",
+                trControl = trainControl(method = "cv", number = 10))
+cmlda <- confusionMatrix(predict(modlda, traincl), traincl$classe)
+knitr::kable(cmlda[2]$table)
+```
+
+The accuracy of this model is `r cmlda[3]$overall[1]`. Cross validation gives an estimate of the out-of-sample error rate
+
+### Naive Bayes
+
+A naive Bayes model is constructed next, using 10-fold cross validation as above. Unlike the LDA model, we will preprocess with PCA to reduce the computation time for the model. Since the variables are on different scales, we ensure that we scale each variable first. Plotting the explained variance versus the number of principal components in the plot below, we see that including the first 25 principal components will explain about 95% of the variance  in the predictors.
+
+```{r PCAplot}
+traincl.pca <- prcomp(traincl[,-53], center = TRUE, scale. = TRUE)
+pca.var <- traincl.pca$sdev ^ 2
+pca.pvar <- pca.var/sum(pca.var)
+ggplot(data.frame(n = 1:(ncol(traincl)-1), cum.var = cumsum(pca.pvar)),
+       aes(x = n, y = cum.var)) +
+        geom_point() +
+        ylim(0, 1) +
+        geom_hline(yintercept = 0.95, col = "red") +
+        xlab("Number of Principal Components") +
+        ylab("Propotion of Variance Explained")
+```
+
+```{r NB}
+# To avoid long runtimes, the code commented out runs the train function and exports a txt file of the output.
+#set.seed(1860)
+#modnb <- train(traincl[,-53],
+#              traincl[,53],
+#              method = "nb",
+#              preProcess = c("center", "scale", "pca"),
+#             trControl = trainControl(method = "cv", number = 10)
+#               )
+#saveRDS(modnb, "modnb.txt")
+modnb <- readRDS("/Users/ross.sweet/Dropbox (Simpson Dropbox)/Coursera Data Science/08 Practical Machine Learning/modnb.txt")
+cmnb <- confusionMatrix(predict(modnb, traincl), traincl$classe)
+knitr::kable(cmnb[2]$table)
+```
+
+The confusion matrix above gives an accuracy of `r cmnb[3]$overall[1]`.
+
+### Random Forests
+
+In order to determine an appropriate number of predictors, the rfcv() function from the randomForest package was used to compute the error for a sequence of number of predictors. Note that this code takes a significant amount of time to run, so the output was saved as a text file and then read in to this document. 
+
+```{r RF}
+# To avoid long runtimes, the code commented out runs the rfcv function and exports a txt file of the output.
+# set.seed(1860)
+# randforcv <- rfcv(traincl[,-53], traincl[,53], step = 0.8)
+# saveRDS(randforcv, "randforcv.txt")
+randforcv <- readRDS("/Users/ross.sweet/Dropbox (Simpson Dropbox)/Coursera Data Science/08 Practical Machine Learning/randforcv.txt")
+```
+
+The plot below shows the error curve has a sharp turn around $n=6$ predictors, where the error is `r randforcv$error.cv[11]`. Any reduction in error with more than 6 predictors is marginal, so we will select the model with $n=6$ predictors.
+
+```{r RFplot}
+rferr <- data.frame(n = randforcv$n.var, error = randforcv$error.cv)
+ggplot(rferr, aes(x = n, y = error)) + 
+        geom_point() +
+        geom_vline(xintercept = 6, col = "blue") +
+        xlab("Number of predictors") +
+        ylab("Error")
+```
+
+Constructing such a random forest, we view the confusion matrix 
+
+```{r RFtable}
+modrf <- randomForest(classe ~ ., data = traincl, mtry = 6)
+cmrf <- confusionMatrix(modrf$predicted, traincl$classe)
+knitr::kable(cmrf[2]$table)
+```
+
+and see that the model has an accuracy of `r cmrf[3]$overall[1]`. Cross validation is not needed in random forests to obtain an estimate of the out of sample error, as the out of bag error is an unbiased estimator of the out of sample error. In this case, we get an out of bag error estimate of 0.3%.
+
+## Results
+
+Comparing the three models, we see that random forests significantly outperform both linear discriminant analysis and naive Bayes. We will use the model obtained by the random forest algorithm to predict classe values for the test data set. Although there is a risk of overfitting given the accuracy result for the random forest model, the validation built into the algorithm provides some measure of assurance that the model will reasonably generalize out of sample. With the test set defined from the data source, we will now predict the classes of the new data.
+
+```{r predicttest}
+knitr::kable(t(predict(modrf, testcl)))
+```
+
